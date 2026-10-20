@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 from sglang_omni.scheduling.types import (
+    ModelRunnerOutput,
     RequestOutput,
     SchedulerOutput,
     SchedulerRequest,
@@ -18,6 +21,13 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
 else:
     pass
+
+
+@dataclass
+class SGLangModelRunnerOutput(ModelRunnerOutput):
+    """Backend result carrying preserved logits for joint beam selection."""
+
+    logits_output: LogitsProcessorOutput | None = None
 
 
 class SGLangOutputProcessor:

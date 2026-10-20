@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypedDict
 
+from pydantic import BaseModel
+
 
 class TokenUsageDict(TypedDict):
     prompt_tokens: int | None
@@ -83,6 +85,8 @@ class SamplingParams:
     stop_token_ids: list[int] = field(default_factory=list)
     seed: int | None = None
     max_new_tokens: int | None = None
+    beam_width: int | None = None
+    n: int = 1
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -95,6 +99,8 @@ class SamplingParams:
             "stop_token_ids": list(self.stop_token_ids),
             "seed": self.seed,
             "max_new_tokens": self.max_new_tokens,
+            "beam_width": self.beam_width,
+            "n": self.n,
         }
 
 
@@ -143,6 +149,15 @@ class GenerateRequest:
         }
 
 
+class CompletionCandidate(BaseModel):
+    """One finalized sequence from a multi-candidate generation."""
+
+    text: str
+    token_ids: list[int]
+    sequence_score: float | None = None
+    finish_reason: str
+
+
 @dataclass
 class GenerateChunk:
     """Streaming chunk from the client."""
@@ -165,6 +180,7 @@ class GenerateChunk:
     language: str | None = None
     audio_data: object = None
     sample_rate: int | None = None
+    candidates: list[CompletionCandidate] = field(default_factory=list)
 
     @property
     def reported_finish_reason(self) -> str:
@@ -179,6 +195,7 @@ class GenerateChunk:
             "index": self.index,
             "token_ids": list(self.token_ids),
             "text": self.text,
+            "candidates": [candidate.model_dump() for candidate in self.candidates],
             "logprobs": self.logprobs,
             "output_token_logprobs": self.output_token_logprobs,
             "omni_rollout": self.omni_rollout,
@@ -238,6 +255,7 @@ class CompletionResult:
     omni_rollout: dict[str, object] | None = None
     weight_version: str | None = None
     language: str | None = None
+    candidates: list[CompletionCandidate] = field(default_factory=list)
 
 
 @dataclass
@@ -251,6 +269,7 @@ class CompletionStreamChunk:
     finish_reason: str | None = None
     usage: UsageInfo | None = None
     stage_name: str | None = None
+    candidates: list[CompletionCandidate] = field(default_factory=list)
 
 
 @dataclass

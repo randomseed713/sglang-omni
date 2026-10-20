@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Generic, Protocol, TypeAlias
 
 import torch
+from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.prefill_inputs import clear_omni_prefill_inputs
@@ -22,6 +23,9 @@ from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
     derive_sampling_seed,
     resolve_row_seed,
+)
+from sglang_omni.scheduling.sglang_backend.output_processor import (
+    SGLangModelRunnerOutput,
 )
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
@@ -627,6 +631,9 @@ class ModelRunner(Generic[RequestDataInput]):
             else:
                 pass
 
+            capture_pre_sample_logits(
+                schedule_batch, forward_batch, batch_result.logits_output
+            )
             if (
                 not schedule_batch.is_prefill_only
                 and batch_result.next_token_ids is None
@@ -729,13 +736,14 @@ class ModelRunner(Generic[RequestDataInput]):
         req_ids = [req.request_id for req in scheduler_output.requests]
         req_id_to_index = {req_id: idx for idx, req_id in enumerate(req_ids)}
 
-        return ModelRunnerOutput(
+        return SGLangModelRunnerOutput(
             outputs=outputs,
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
             can_run_cuda_graph=bool(batch_result.can_run_cuda_graph),
             next_token_ids=batch_result.next_token_ids,
             host_token_ids=host_token_ids,
+            logits_output=batch_result.logits_output,
         )
 
     def ensure_next_token_ids(

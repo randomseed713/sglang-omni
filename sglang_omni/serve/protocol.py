@@ -65,6 +65,10 @@ class ChatCompletionRequest(BaseModel):
     max_completion_tokens: int | None = Field(default=None, ge=1)
     stop: str | list[str] | None = None
     seed: int | None = None
+    stop_token_ids: list[int] | None = None
+
+    beam_width: int | None = Field(default=None, ge=1)
+    n: int = Field(default=1, ge=1)
 
     # Streaming
     stream: bool = False
@@ -116,6 +120,12 @@ class ChatCompletionRequest(BaseModel):
             )
         else:
             pass
+        if self.n > (self.beam_width or 1):
+            raise ValueError(
+                "n must not exceed beam_width; parallel sampling is unsupported"
+            )
+        else:
+            pass
         return self
 
     @property
@@ -128,6 +138,7 @@ class ChatCompletionChoice(BaseModel):
 
     index: int = 0
     message: dict[str, object]
+    sequence_score: float | None = None
     finish_reason: str | None = "stop"
 
 
@@ -155,6 +166,7 @@ class ChatCompletionStreamChoice(BaseModel):
 
     index: int = 0
     delta: ChatCompletionStreamDelta
+    sequence_score: float | None = None
     finish_reason: str | None = None
 
 

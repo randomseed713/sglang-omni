@@ -24,6 +24,9 @@ HTTP API -> Client -> Coordinator -> Stage -> Scheduler -> ModelRunner -> model 
 
 Refer to the layer-specific document for specific design details.
 
+[Native text beam search](./beam_search.md) describes the sid-gr pipeline and its
+shared scheduler/runner integration.
+
 ## Directory Layout
 
 ```text

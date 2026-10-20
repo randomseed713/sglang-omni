@@ -136,3 +136,16 @@ def test_execution_bridge_rejects_speculative_decoding() -> None:
             spec_algorithm=SpecAlgorithm(is_none=False),
             future_map=future_map,
         )
+
+
+def test_publish_tokens_leaves_beam_members_for_joint_selection() -> None:
+    bridge, future_map = make_bridge()
+    batch = SimpleNamespace(
+        req_pool_indices=torch.tensor([4, 7, 9, 10]),
+        input_ids=torch.tensor([1, 2, 3, 4]),
+    )
+    bridge.publish_next_tokens(batch, torch.tensor([31, 32]))
+    indices, payload = future_map.stashed
+    assert indices.tolist() == [4, 7]
+    assert payload.bonus_tokens.tolist() == [31, 32]
+    assert batch.input_ids is None

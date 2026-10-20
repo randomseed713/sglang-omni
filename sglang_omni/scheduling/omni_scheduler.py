@@ -28,12 +28,14 @@ from itertools import islice
 from typing import TYPE_CHECKING, Callable, Generic
 
 import torch
+from sglang.srt.beam_search.fork import free_member_rows
+from sglang.srt.beam_search.output import pack_beam_search_output
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.io_struct import AbortReq, GenerateReqInput
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -88,6 +90,9 @@ from sglang_omni.scheduling.sglang_backend.ar_session import (
     ARSessionBridge,
     SessionUnit,
     is_close_request,
+)
+from sglang_omni.scheduling.sglang_backend.output_processor import (
+    SGLangModelRunnerOutput,
 )
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.types import (
@@ -1695,6 +1700,38 @@ class OmniScheduler(Generic[RequestDataT]):
                 return
             else:
                 pass
+            if (
+                req.sampling_params.beam_width is not None
+                and req.sampling_params.beam_width > 1
+            ):
+                if self.enable_async_decode:
+                    self.emit_request_error(
+                        req_id,
+                        ValueError(
+                            "Invalid beam request: enable_async_decode must be False"
+                        ),
+                    )
+                    return
+                else:
+                    pass
+                beam_error = self.beam_coordinator.validate_and_init(
+                    req,
+                    GenerateReqInput(
+                        return_logprob=req_data.return_logprob,
+                        return_hidden_states=req.return_hidden_states,
+                        return_sampling_mask=req.return_sampling_mask,
+                        return_routed_experts=req.return_routed_experts,
+                    ),
+                )
+                if beam_error is not None:
+                    self.emit_request_error(
+                        req_id, ValueError(f"Invalid beam request: {beam_error}")
+                    )
+                    return
+                else:
+                    pass
+            else:
+                pass
             self.apply_prompt_cache_epoch(req)
             _emit_event(
                 request_id=req_id,
@@ -1855,6 +1892,15 @@ class OmniScheduler(Generic[RequestDataT]):
             )
         )
 
+    def stash_chunked_request(self, req: Req) -> None:
+        if req.beam_group is not None:
+            # note (Codex): Advance uncached beam chunks using the native int64 prefix contract.
+            req.prefix_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : req.extend_range.end
+            ].to(dtype=torch.int64, copy=True)
+        else:
+            _Upstream.stash_chunked_request(self, req)
+
     def get_next_batch_to_run(self):
         """Bridge Omni's batch-owning loops to the upstream scheduler contract.
 
@@ -2001,8 +2047,12 @@ class OmniScheduler(Generic[RequestDataT]):
         sched_output = self.build_sched_output(batch)
         mr_output = self.model_runner.execute(sched_output)
         self.emit_prefill_end_for_batch(batch)
+        batch_result = self.make_batch_result(mr_output)
+        self.beam_coordinator.maybe_select_and_relay(
+            batch, batch_result, chunked_req=self.chunked_req
+        )
         self.emit_stream_output(sched_output, mr_output)
-        return self.make_batch_result(mr_output)
+        return batch_result
 
     def build_sched_output(self, batch):
         """Wrap a ScheduleBatch into the SchedulerOutput the model runner
@@ -2105,7 +2155,13 @@ class OmniScheduler(Generic[RequestDataT]):
             pass
         return GenerationBatchResult(
             # note (Junnan Li): Result processing expects a logits container.
-            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            logits_output=(
+                mr_output.logits_output
+                if isinstance(mr_output, SGLangModelRunnerOutput)
+                and mr_output.logits_output is not None
+                and mr_output.logits_output.beam is not None
+                else LogitsProcessorOutput(next_token_logits=None)
+            ),
             next_token_ids=next_token_ids,
             can_run_cuda_graph=mr_output.can_run_cuda_graph,
         )
@@ -2307,6 +2363,7 @@ class OmniScheduler(Generic[RequestDataT]):
                     model_runner.on_request_finished(rid, data)
                 else:
                     pass
+                data.beam_output = pack_beam_search_output(req)
                 data.output_ids = list(req.output_ids)
                 data.weight_version = get_serving().weight_version
                 self.flush_stream_output(rid, data)
@@ -2552,6 +2609,7 @@ class OmniScheduler(Generic[RequestDataT]):
             waiting_queue = []
             for req in self.waiting_queue:
                 if req.rid == request_id:
+                    self.beam_coordinator.retire_group(req)
                     detach_request_data(req)
                 else:
                     waiting_queue.append(req)
@@ -3137,6 +3195,10 @@ class OmniScheduler(Generic[RequestDataT]):
                 else:
                     pass
                 req.to_finish = FINISH_ABORT()
+                if req is self.chunked_req and req.beam_group is not None:
+                    self._pending_chunked_abort_req = req  # noqa: leading-underscore  # Native chunked-prefill abort contract.
+                else:
+                    pass
                 marked = True
         return marked
 
@@ -3198,6 +3260,13 @@ class OmniScheduler(Generic[RequestDataT]):
         return None
 
     def release_request_kv_cache(self, req: Req) -> None:
+        if req.beam_group is not None:
+            self.beam_coordinator.retire_group(req)
+            free_member_rows(
+                req.beam_group, self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
+        else:
+            pass
         if not req.kv.holds_kv and not req.kv.holds_mamba:
             return
         else:

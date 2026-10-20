@@ -19,7 +19,9 @@ from unittest.mock import Mock
 import pytest
 import sglang.srt.managers.scheduler as sglang_scheduler_module
 import torch
+from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -34,6 +36,9 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling import omni_scheduler as omni_scheduler_module
 from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler, PendingDecode
+from sglang_omni.scheduling.sglang_backend.output_processor import (
+    SGLangModelRunnerOutput,
+)
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
@@ -41,6 +46,14 @@ from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleSched
 from sglang_omni.scheduling.types import ModelRunnerOutput
 from sglang_omni.serve.openai_errors import is_bad_request_error
 from tests.unit_test.pipeline.helpers import run_scheduler
+
+
+def init_beam_state(scheduler: OmniScheduler) -> None:
+    scheduler.beam_coordinator = SimpleNamespace(
+        retire_group=lambda request: None,
+        maybe_select_and_relay=lambda batch, result, *, chunked_req: None,
+    )
+    scheduler.chunked_req = None
 
 
 class SchedulerStageMetricsRecorder:
@@ -75,6 +88,7 @@ def req_to_token_pool() -> SimpleNamespace:
 
 
 def init_sync_request_build_state(scheduler: OmniScheduler) -> None:
+    init_beam_state(scheduler)
     scheduler.request_admission_lock = threading.RLock()
     scheduler.request_build_executor = None
     scheduler.request_build_max_pending = 0
@@ -106,6 +120,7 @@ def init_sync_request_build_state(scheduler: OmniScheduler) -> None:
 
 
 def init_terminal_output_state(scheduler: OmniScheduler) -> None:
+    init_beam_state(scheduler)
     scheduler.request_admission_lock = threading.RLock()
     scheduler.is_entry_rank = True
     scheduler.model_runner = None
@@ -126,6 +141,7 @@ def new_stage_payload(request_id: str) -> StagePayload:
 def make_abortable_req(request_id: str, **attributes):
     values = {
         "rid": request_id,
+        "beam_group": None,
         "to_finish": None,
         "finished_reason": None,
         "is_retracted": False,
@@ -531,6 +547,7 @@ def test_upstream_queue_limit_abort_is_translated_to_omni_output() -> None:
     scheduler.ipc_channels = omni_scheduler_module.OmniIpcChannels(scheduler)
     trace_aborts: list[dict] = []
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-over-limit",
         cache_request_handle=CacheRequestHandle(rid="req-over-limit", attempt_id=0),
         priority=None,
@@ -579,6 +596,7 @@ def history_request(
     data = SGLangARRequestData()
     data.decode_input_embeds = [snapshot[row] for snapshot in snapshots]
     return SimpleNamespace(
+        beam_group=None,
         rid=f"req-{row}",
         priority=None,
         is_retracted=is_retracted,
@@ -656,6 +674,7 @@ def test_retracted_request_with_model_owned_data_is_requeued(
     data_cls = getattr(importlib.import_module(module_name), class_name)
     scheduler = requeue_scheduler()
     retracted = SimpleNamespace(
+        beam_group=None,
         rid="req-model-owned",
         priority=None,
         is_retracted=True,
@@ -712,7 +731,9 @@ def enqueue_limit_scheduler(monkeypatch):
 
 def admission_req(rid: str, token_ids: list[int]) -> SimpleNamespace:
     return SimpleNamespace(
+        beam_group=None,
         rid=rid,
+        sampling_params=SimpleNamespace(beam_width=None),
         priority=None,
         weight_version_events=[],
         output_ids=[],
@@ -807,7 +828,7 @@ def test_process_input_requests_rejects_before_build_when_waiting_queue_is_full(
     scheduler.outbox = Queue()
     scheduler.is_entry_rank = True
     scheduler.max_queued_requests = 1
-    scheduler.waiting_queue = [SimpleNamespace(rid="req-occupant")]
+    scheduler.waiting_queue = [SimpleNamespace(beam_group=None, rid="req-occupant")]
     scheduler.pending_stream_ingress = {}
     scheduler.deferred_request_payloads = {}
     scheduler.dirty_deferred_request_ids = set()
@@ -857,7 +878,9 @@ def staging_scheduler(
     scheduler.deferred_request_payloads = {}
     scheduler.aborted_request_ids = set()
     scheduler.max_queued_requests = max_queued_requests
-    scheduler.waiting_queue = [SimpleNamespace(rid="req-occupant")] if waiting else []
+    scheduler.waiting_queue = (
+        [SimpleNamespace(beam_group=None, rid="req-occupant")] if waiting else []
+    )
     return scheduler
 
 
@@ -1035,6 +1058,7 @@ def test_omni_scheduler_custom_runner_stamps_upstream_launch_metadata() -> None:
             return SimpleNamespace()
 
     scheduler = object.__new__(OmniScheduler)
+    init_beam_state(scheduler)
     scheduler.model_runner = FakeModelRunner()
     scheduler.stream_output_builder = None
     scheduler.prefill_start_done = set()
@@ -1047,7 +1071,10 @@ def test_omni_scheduler_custom_runner_stamps_upstream_launch_metadata() -> None:
         return SimpleNamespace(
             reqs=[
                 SimpleNamespace(
-                    rid="r", omni_data=SimpleNamespace(), inflight_middle_chunks=0
+                    beam_group=None,
+                    rid="r",
+                    omni_data=SimpleNamespace(),
+                    inflight_middle_chunks=0,
                 )
             ],
             is_prefill_only=False,
@@ -1093,8 +1120,12 @@ def test_omni_scheduler_resolve_drops_retracted_req() -> None:
     scheduler.run_batch_resolve = fake_resolve
     scheduler.process_batch_result = fake_process
 
-    keep = SimpleNamespace(rid="keep", finished=lambda: False, is_retracted=False)
-    retr = SimpleNamespace(rid="retr", finished=lambda: False, is_retracted=True)
+    keep = SimpleNamespace(
+        beam_group=None, rid="keep", finished=lambda: False, is_retracted=False
+    )
+    retr = SimpleNamespace(
+        beam_group=None, rid="retr", finished=lambda: False, is_retracted=True
+    )
     batch = SimpleNamespace(reqs=[keep, retr])
 
     scheduler.resolve_and_process(batch, object(), object())
@@ -1127,8 +1158,12 @@ def test_omni_scheduler_fast_path_drops_retracted_req() -> None:
             self.out_cache_loc = None
 
     scheduler = object.__new__(OmniScheduler)
-    keep = SimpleNamespace(rid="keep", finished=lambda: False, is_retracted=False)
-    retr = SimpleNamespace(rid="retr", finished=lambda: False, is_retracted=True)
+    keep = SimpleNamespace(
+        beam_group=None, rid="keep", finished=lambda: False, is_retracted=False
+    )
+    retr = SimpleNamespace(
+        beam_group=None, rid="retr", finished=lambda: False, is_retracted=True
+    )
 
     # retracted (not finished) must be dropped from the stale batch
     out = scheduler.drop_stale_overrun(FakeBatch([keep, retr]))
@@ -1137,7 +1172,9 @@ def test_omni_scheduler_fast_path_drops_retracted_req() -> None:
     assert out.out_cache_loc.tolist() == [100]
 
     # all dropped -> None so run_batch is skipped
-    fin = SimpleNamespace(rid="fin", finished=lambda: True, is_retracted=False)
+    fin = SimpleNamespace(
+        beam_group=None, rid="fin", finished=lambda: True, is_retracted=False
+    )
     assert scheduler.drop_stale_overrun(FakeBatch([retr, fin])) is None
 
     # nothing stale -> batch returned unchanged, filter_batch never called
@@ -1262,6 +1299,7 @@ def test_omni_scheduler_abort_marks_running_request_for_finish(monkeypatch) -> N
     scheduler.waiting_queue = []
 
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-run",
         to_finish=None,
         finished_reason=None,
@@ -1319,7 +1357,7 @@ def test_omni_scheduler_abort_cleans_queued_request_immediately(monkeypatch) -> 
     scheduler.prefill_end_done = set()
     scheduler.inbox = Queue()
 
-    req = SimpleNamespace(rid="req-wait")
+    req = SimpleNamespace(beam_group=None, rid="req-wait")
     request_data = SimpleNamespace(req=req)
     req.omni_data = request_data
     scheduler.waiting_queue = [req]
@@ -1358,7 +1396,7 @@ def test_omni_scheduler_abort_treats_retracted_alias_as_waiting_owned() -> None:
     )
     request_data = SimpleNamespace(req=req)
     req.omni_data = request_data
-    other_req = SimpleNamespace(rid="req-other")
+    other_req = SimpleNamespace(beam_group=None, rid="req-other")
     stale_batch = SimpleNamespace(
         reqs=[req, other_req],
         req_pool_indices=torch.tensor([10, 11]),
@@ -1429,6 +1467,7 @@ def test_omni_scheduler_flushes_stream_before_terminal_result(monkeypatch) -> No
         decode_input_embeds=None,
     )
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-finished",
         omni_data=request_data,
         output_ids=[1, 2],
@@ -1517,6 +1556,7 @@ def test_omni_scheduler_fish_abort_during_step_suppresses_chunk_and_result() -> 
         output_codes=[codes],
     )
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-fish",
         to_finish=None,
         finished=lambda: False,
@@ -1579,6 +1619,7 @@ def test_stream_output_sets_finish_reason_and_drains_runner_before_terminal() ->
     )
     finished_reason = SimpleNamespace(to_json=lambda: {"type": "stop"})
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-1",
         finished=lambda: True,
         finished_reason=finished_reason,
@@ -1615,6 +1656,7 @@ def test_stream_output_cleans_request_when_runner_finish_hook_fails() -> None:
     scheduler.model_runner = SimpleNamespace(on_request_finished=fail_finish_hook)
     data = SimpleNamespace(prefill_input_embeds=None, decode_input_embeds=None)
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-hook-error",
         finished=lambda: True,
         finished_reason=None,
@@ -1654,6 +1696,7 @@ def test_stream_output_releases_request_when_terminal_flush_fails() -> None:
     )
     data = SimpleNamespace(prefill_input_embeds=None, decode_input_embeds=None)
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-flush-error",
         finished=lambda: True,
         finished_reason=None,
@@ -1701,6 +1744,8 @@ def test_stream_output_atomically_claims_request_data_against_abort() -> None:
     terminal_lock = InstrumentedRLock()
 
     class Request:
+        beam_group = None
+
         def __init__(self, data):
             self.rid = "req-terminal-abort-race"
             self.omni_data_value = data
@@ -1876,6 +1921,7 @@ def test_abort_publishes_request_id_before_marking_terminal_finish() -> None:
 
     data = SimpleNamespace(prefill_input_embeds=None, decode_input_embeds=None)
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-abort-wins",
         output_ids=[],
         finished_reason=None,
@@ -1936,7 +1982,7 @@ def test_abort_publishes_request_id_before_marking_terminal_finish() -> None:
 
 def test_terminal_request_data_is_collectable_without_cyclic_gc() -> None:
     class Request:
-        pass
+        beam_group = None
 
     class RequestData:
         pass
@@ -1995,6 +2041,7 @@ def test_stream_output_skips_runner_hook_for_aborted_requests() -> None:
     )
     data = SimpleNamespace()
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-1",
         finished=lambda: True,
         finished_reason=None,
@@ -2023,6 +2070,7 @@ def test_stream_output_closes_late_stream_ingress() -> None:
 
     data = SimpleNamespace(prefill_input_embeds=None, decode_input_embeds=None)
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-late-stream",
         finished=lambda: True,
         finished_reason=None,
@@ -2309,6 +2357,7 @@ def test_stream_output_drops_stale_terminal_alias_without_raising() -> None:
     scheduler.prefill_end_done = set()
 
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-stale-terminal",
         finished=lambda: True,
         finished_reason=None,
@@ -2387,14 +2436,18 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
     init_sync_request_build_state(scheduler)
 
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-delayed",
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
-        sampling_params=SimpleNamespace(max_new_tokens=1, min_new_tokens=0),
+        sampling_params=SimpleNamespace(
+            beam_width=None, max_new_tokens=1, min_new_tokens=0
+        ),
         output_ids=[],
         priority=None,
     )
     scheduler.request_builder = lambda payload: SimpleNamespace(
+        beam_width=None,
         req=req,
         enforce_request_limits=False,
         max_new_tokens=1,
@@ -2450,14 +2503,19 @@ def scheduler_with_build_pool(monkeypatch, builder) -> OmniScheduler:
 
 def built_request(request_id: str) -> SimpleNamespace:
     req = SimpleNamespace(
+        beam_group=None,
         rid=request_id,
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
-        sampling_params=SimpleNamespace(max_new_tokens=1, min_new_tokens=0),
+        sampling_params=SimpleNamespace(
+            beam_width=None, max_new_tokens=1, min_new_tokens=0
+        ),
         output_ids=[],
         priority=None,
     )
-    return SimpleNamespace(req=req, enforce_request_limits=False, max_new_tokens=1)
+    return SimpleNamespace(
+        beam_width=None, req=req, enforce_request_limits=False, max_new_tokens=1
+    )
 
 
 def test_a_fast_request_build_joins_the_waiting_queue_in_the_same_iteration(
@@ -2710,7 +2768,7 @@ def test_first_prefill_result_counts_its_tokens_and_busy_time(monkeypatch) -> No
     scheduler = construct_omni_scheduler(monkeypatch)
     prefill_batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
-        reqs=[SimpleNamespace(rid="request-1")],
+        reqs=[SimpleNamespace(beam_group=None, rid="request-1")],
         forward_iter=1,
         launch_ts=time.monotonic() - 0.01,
         after_idle_gap=False,
@@ -3211,8 +3269,11 @@ def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
     scheduler.max_total_num_tokens = 128
     init_sync_request_build_state(scheduler)
 
-    sampling_params = SimpleNamespace(max_new_tokens=10, min_new_tokens=0)
+    sampling_params = SimpleNamespace(
+        beam_width=None, max_new_tokens=10, min_new_tokens=0
+    )
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-ok",
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
@@ -3220,7 +3281,9 @@ def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
         output_ids=[],
         priority=None,
     )
-    req_data = SimpleNamespace(req=req, max_new_tokens=10, enforce_request_limits=True)
+    req_data = SimpleNamespace(
+        beam_width=None, req=req, max_new_tokens=10, enforce_request_limits=True
+    )
     scheduler.request_builder = lambda payload: req_data
 
     scheduler.process_input_requests([new_stage_payload("req-ok")])
@@ -3252,10 +3315,12 @@ def test_omni_scheduler_clamps_request_to_strict_prefill_budget() -> None:
 
     requested_max_new_tokens = 14
     sampling_params = SimpleNamespace(
+        beam_width=None,
         max_new_tokens=requested_max_new_tokens,
         min_new_tokens=0,
     )
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-near-capacity",
         origin_input_ids=[1] * 9,
         origin_input_ids_unpadded=[1] * 9,
@@ -3264,6 +3329,7 @@ def test_omni_scheduler_clamps_request_to_strict_prefill_budget() -> None:
         priority=None,
     )
     req_data = SimpleNamespace(
+        beam_width=None,
         req=req,
         max_new_tokens=requested_max_new_tokens,
         enforce_request_limits=True,
@@ -3317,13 +3383,17 @@ def test_omni_scheduler_rejects_custom_request_over_context() -> None:
     init_sync_request_build_state(scheduler)
 
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-long",
         origin_input_ids=[1, 2, 3, 4, 5],
         origin_input_ids_unpadded=[1, 2, 3, 4, 5],
-        sampling_params=SimpleNamespace(max_new_tokens=10, min_new_tokens=0),
+        sampling_params=SimpleNamespace(
+            beam_width=None, max_new_tokens=10, min_new_tokens=0
+        ),
         output_ids=[],
     )
     request_data = SimpleNamespace(
+        beam_width=None,
         req=req,
         enforce_request_limits=True,
         max_new_tokens=10,
@@ -3377,13 +3447,17 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors(monkeypatch) -> N
     init_sync_request_build_state(scheduler)
 
     over_context_req = SimpleNamespace(
+        beam_group=None,
         rid="req-long",
         origin_input_ids=[1, 2, 3, 4, 5],
         origin_input_ids_unpadded=[1, 2, 3, 4, 5],
-        sampling_params=SimpleNamespace(max_new_tokens=10, min_new_tokens=0),
+        sampling_params=SimpleNamespace(
+            beam_width=None, max_new_tokens=10, min_new_tokens=0
+        ),
         output_ids=[],
     )
     scheduler.request_builder = lambda payload: SimpleNamespace(
+        beam_width=None,
         req=over_context_req,
         enforce_request_limits=True,
         max_new_tokens=10,
@@ -3395,13 +3469,17 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors(monkeypatch) -> N
     assert scheduler.waiting_queue == []
 
     over_kv_req = SimpleNamespace(
+        beam_group=None,
         rid="req-kv",
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
-        sampling_params=SimpleNamespace(max_new_tokens=4, min_new_tokens=0),
+        sampling_params=SimpleNamespace(
+            beam_width=None, max_new_tokens=4, min_new_tokens=0
+        ),
         output_ids=[],
     )
     scheduler.request_builder = lambda payload: SimpleNamespace(
+        beam_width=None,
         req=over_kv_req,
         enforce_request_limits=False,
         max_new_tokens=4,
@@ -3430,8 +3508,11 @@ def test_omni_scheduler_leaves_request_budget_unchanged_without_opt_in() -> None
     scheduler.max_total_num_tokens = 128
     init_sync_request_build_state(scheduler)
 
-    sampling_params = SimpleNamespace(max_new_tokens=3, min_new_tokens=0)
+    sampling_params = SimpleNamespace(
+        beam_width=None, max_new_tokens=3, min_new_tokens=0
+    )
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-original",
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
@@ -3440,6 +3521,7 @@ def test_omni_scheduler_leaves_request_budget_unchanged_without_opt_in() -> None
         priority=None,
     )
     req_data = SimpleNamespace(
+        beam_width=None,
         req=req,
         max_new_tokens=3,
         enforce_request_limits=False,
@@ -3482,6 +3564,7 @@ def test_omni_scheduler_result_adapter_failure_emits_error_without_raise(
         decode_input_embeds=[torch.ones(1)],
     )
     req = SimpleNamespace(
+        beam_group=None,
         rid="req-adapter",
         omni_data=request_data,
         _omni_terminal_claimed=False,
@@ -3544,3 +3627,56 @@ def test_omni_scheduler_running_abort_does_not_leak_prefill_dedup_state(
     assert ends == [("req-1", "aborted")]
     assert scheduler.prefill_start_done == set()
     assert scheduler.prefill_start_done == set()
+
+
+def test_beam_failure_releases_shared_suffix_once_before_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    freed_tokens: list[int] = []
+    freed_rows: list[int] = []
+    scheduler = object.__new__(OmniScheduler)
+    init_beam_state(scheduler)
+    scheduler.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.tensor([[10, 11, 12, 13], [10, 11, 12, 14]]),
+        free_rows=freed_rows.extend,
+    )
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        free=lambda tokens: freed_tokens.extend(tokens.tolist())
+    )
+    scheduler.tree_cache = None
+    request = make_abortable_req("beam-failure", kv=ReqKvInfo(req_pool_idx=0))
+    request.kv.kv_allocated_len = 4
+    request.kv.kv_committed_len = 4
+    request.beam_group = SimpleNamespace(
+        leader=request,
+        prompt_len=2,
+        member_rows=torch.tensor([1]),
+        member_rows_cpu=torch.tensor([1]),
+        all_rows=torch.tensor([0, 1]),
+    )
+    released_leaders: list[str] = []
+
+    def release_leader(request, tree_cache) -> None:
+        assert request.kv.kv_allocated_len == 2
+        assert request.kv.kv_committed_len == 2
+        assert sorted(freed_tokens) == [12, 13, 14]
+        released_leaders.append(request.rid)
+
+    monkeypatch.setattr(omni_scheduler_module, "release_kv_cache", release_leader)
+    scheduler.release_request_kv_cache(request)
+    assert freed_rows == [1]
+    assert released_leaders == ["beam-failure"]
+
+
+def test_beam_logits_survive_scheduler_result_conversion() -> None:
+    logits = LogitsProcessorOutput(next_token_logits=torch.tensor([[1.0, 2.0]]))
+    logits.beam = BeamLogitsCapture(leader_logits=logits.next_token_logits.clone())
+    result = OmniScheduler.make_batch_result(
+        SGLangModelRunnerOutput(
+            outputs={},
+            logits_output=logits,
+            next_token_ids=torch.tensor([1]),
+        )
+    )
+    assert result.logits_output.beam.leader_logits.tolist() == [[1.0, 2.0]]
+    assert result.next_token_ids.tolist() == [1]

@@ -215,6 +215,7 @@ def create_app(
     supports_uploaded_voice_references: bool = True,
     custom_voice_config: CustomVoiceConfig | None = None,
     supports_audio_translation: bool = False,
+    supports_beam_search: bool = False,
     required_speech_reference_count: int | None = None,
     speech_reference_text_required: bool = False,
     speech_reference_text_excludes_instructions: bool = False,
@@ -292,6 +293,7 @@ def create_app(
     app.state.model_name = model_name or "sglang-omni"
     app.state.architectures = [a for a in (architectures or []) if a]
     app.state.supports_audio_translation = supports_audio_translation
+    app.state.supports_beam_search = supports_beam_search
     app.state.audio_chunking = audio_chunking or ResolvedAudioChunking.disabled()
     app.state.long_audio_admission = LongAudioAdmission(
         app.state.audio_chunking.max_concurrent_long_audio_requests
@@ -754,6 +756,16 @@ def register_chat_completions(app: FastAPI) -> None:
         created = int(time.time())
         model = req.model or default_model
 
+        if (
+            req.beam_width is not None
+            and req.beam_width > 1
+            and not app.state.supports_beam_search
+        ):
+            raise HTTPException(
+                status_code=400, detail="This pipeline does not support beam search"
+            )
+        else:
+            pass
         gen_req = build_chat_generate_request(req)
 
         # Determine audio format from request
@@ -863,13 +875,23 @@ async def chat_non_stream(
         id=response_id,
         created=created,
         model=model,
-        choices=[
-            ChatCompletionChoice(
-                index=0,
-                message=message,
-                finish_reason=result.finish_reason,
-            )
-        ],
+        choices=(
+            [
+                ChatCompletionChoice(
+                    index=index,
+                    message={"role": "assistant", "content": candidate.text},
+                    finish_reason=candidate.finish_reason,
+                    sequence_score=candidate.sequence_score,
+                )
+                for index, candidate in enumerate(result.candidates)
+            ]
+            if result.candidates
+            else [
+                ChatCompletionChoice(
+                    index=0, message=message, finish_reason=result.finish_reason
+                )
+            ]
+        ),
         usage=usage,
     )
 
@@ -935,6 +957,40 @@ async def chat_stream_events(
     audio_format: str,
 ) -> AsyncIterator[str]:
     """Streaming chat completion generator (yields SSE events)."""
+    if req.beam_width is not None and req.beam_width > 1:
+        result = await client.completion(
+            gen_req, request_id=request_id, audio_format=audio_format
+        )
+        response = ChatCompletionStreamResponse(
+            id=response_id,
+            created=created,
+            model=model,
+            choices=[
+                ChatCompletionStreamChoice(
+                    index=index,
+                    delta=ChatCompletionStreamDelta(
+                        role="assistant", content=candidate.text
+                    ),
+                    finish_reason=candidate.finish_reason,
+                    sequence_score=candidate.sequence_score,
+                )
+                for index, candidate in enumerate(result.candidates)
+            ],
+            usage=(
+                UsageResponse(
+                    prompt_tokens=result.usage.prompt_tokens or 0,
+                    completion_tokens=result.usage.completion_tokens or 0,
+                    total_tokens=result.usage.total_tokens or 0,
+                )
+                if result.usage is not None
+                else None
+            ),
+        )
+        yield f"data: {response.model_dump_json()}\n\n"
+        yield f"data: {STREAM_DONE_SENTINEL}\n\n"
+        return
+    else:
+        pass
     role_sent = False
     requested_modalities = req.modalities or ["text"]
     finish_reason: str | None = None
@@ -1095,8 +1151,11 @@ def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
             req.repetition_penalty if req.repetition_penalty is not None else 1.0
         ),
         stop=stop,
+        stop_token_ids=req.stop_token_ids or [],
         seed=req.seed,
         max_new_tokens=req.effective_max_tokens,
+        beam_width=req.beam_width,
+        n=req.n,
     )
 
     # Convert messages

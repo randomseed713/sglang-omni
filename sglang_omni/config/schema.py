@@ -582,6 +582,7 @@ class PipelineConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     architecture: ClassVar[str | None] = None
     architecture_aliases: ClassVar[tuple[str, ...]] = ()
+    supports_beam_search: ClassVar[bool] = False
     requires_model_capabilities: ClassVar[bool] = False
     tensor_parallel_disable_custom_all_reduce_stages: ClassVar[tuple[str, ...]] = ()
     required_speech_reference_count: ClassVar[int | None] = None

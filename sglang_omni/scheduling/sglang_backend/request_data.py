@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import torch
+from sglang.srt.beam_search.output import BeamSearchOutput
 from sglang.srt.managers.schedule_batch import Req
 
 from sglang_omni.proto.request import StagePayload
@@ -84,6 +85,7 @@ def validate_prompt_token_ids(input_ids: torch.Tensor, vocab_size: int) -> None:
 class SGLangARRequestData(ARRequestData):
     """Per-request state for SGLang-backed AR stages."""
 
+    beam_output: BeamSearchOutput | None = None
     req: Req | None = None
     # note (Junnan Li): The bridge binds unit-relative spans to retained session history.
     unit_embedding_spans: list[EmbeddingSpan] = field(default_factory=list)

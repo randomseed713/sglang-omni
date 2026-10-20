@@ -131,7 +131,7 @@ class SGLangExecutionBridge:
             next_token_ids = next_token_ids.to(self.device, non_blocking=True)
         else:
             pass
-        indices = batch.req_pool_indices
+        indices = batch.req_pool_indices[: next_token_ids.shape[0]]
         self.future_map.stash(
             indices,
             self.relay_payload_type(bonus_tokens=next_token_ids),

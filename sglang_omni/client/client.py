@@ -25,6 +25,7 @@ from sglang_omni.client.types import (
     AbortResult,
     ClientError,
     CompletionAudio,
+    CompletionCandidate,
     CompletionResult,
     CompletionStreamChunk,
     GenerateChunk,
@@ -276,6 +277,7 @@ class Client:
             audio=audio,
             finish_reason=finish_reason or "stop",
             usage=last_chunk.usage,
+            candidates=last_chunk.candidates,
             output_token_logprobs=(
                 logprobs_parts if saw_output_token_logprobs else None
             ),
@@ -354,6 +356,7 @@ class Client:
                     finish_reason=chunk.finish_reason,
                     usage=chunk.usage,
                     stage_name=chunk.stage_name,
+                    candidates=chunk.candidates,
                 )
             held_text = stop_trimmer.finish() if stop_trimmer is not None else ""
             if held_text:
@@ -736,6 +739,14 @@ class Client:
                 return chunk
             else:
                 pass
+            candidates = result.get("candidates", [])
+            if isinstance(candidates, list):
+                chunk.candidates = [
+                    CompletionCandidate.model_validate(candidate)
+                    for candidate in candidates
+                ]
+            else:
+                raise ValueError("Generation candidates must be a list")
             text = result.get("text")
             if isinstance(text, str):
                 chunk.text = text
