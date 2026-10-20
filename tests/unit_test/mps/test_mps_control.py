@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import fcntl
+import os
+import socket
 import subprocess
 from pathlib import Path
 
@@ -119,6 +121,32 @@ def test_owner_liveness_comes_from_the_kernel_held_lease(tmp_path):
         fcntl.flock(owner, fcntl.LOCK_UN)
 
     assert not client.owner_lease_held(lease_file)
+
+
+def test_daemon_identity_uses_socket_peer_without_pid_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = control.SubprocessMpsControlClient()
+    process_id = os.getpid()
+    process_directory = Path(f"/proc/{process_id}")
+
+    def read_process_bytes(path: Path) -> bytes:
+        if path == process_directory / "cmdline":
+            return b"/usr/bin/nvidia-cuda-mps-control\x00-d\x00"
+        else:
+            assert path == process_directory / "environ"
+            return f"CUDA_MPS_PIPE_DIRECTORY={tmp_path}\x00".encode()
+
+    monkeypatch.setattr(Path, "read_bytes", read_process_bytes)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+        listener.bind(str(tmp_path / "control"))
+        listener.listen(2)
+        assert client.read_daemon_identity(tmp_path) == process_id
+
+        different_user_id = os.getuid() + 1
+        monkeypatch.setattr(os, "getuid", lambda: different_user_id)
+        with pytest.raises(MpsControlError, match="belongs to uid"):
+            client.read_daemon_identity(tmp_path)
 
 
 def test_client_token_is_read_from_the_current_client_environment(monkeypatch):

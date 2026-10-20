@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import fcntl
 import os
+import socket
+import struct
 import subprocess
 from pathlib import Path
 
@@ -88,11 +90,34 @@ class SubprocessMpsControlClient:
             raise MpsControlError(f"failed to start {_CONTROL_BINARY}: {exc}") from exc
 
     def read_daemon_identity(self, pipe_dir: Path) -> int:
-        """Read and prove the native control-daemon identity for ``pipe_dir``."""
+        """Verify the control socket peer and its exact daemon environment."""
 
         pid_file = pipe_dir / f"{_CONTROL_BINARY}.pid"
         try:
             raw_pid = pid_file.read_text().strip()
+        except FileNotFoundError:
+            # note (Chenzhengda.zd): Some drivers expose daemon identity only through the socket.
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+                    connection.settimeout(_QUERY_TIMEOUT_SECONDS)
+                    connection.connect(str(pipe_dir / "control"))
+                    credentials = struct.unpack(
+                        "3i",
+                        connection.getsockopt(
+                            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                        ),
+                    )
+            except OSError as exc:
+                raise MpsControlError(
+                    f"cannot identify MPS control socket {pipe_dir / 'control'}: {exc}"
+                ) from exc
+            if credentials[1] != os.getuid():
+                raise MpsControlError(
+                    f"MPS daemon belongs to uid {credentials[1]}, expected {os.getuid()}"
+                ) from None
+            else:
+                pass
+            raw_pid = str(credentials[0])
         except OSError as exc:
             raise MpsControlError(
                 f"cannot read native PID file {pid_file}: {exc}"
@@ -105,7 +130,9 @@ class SubprocessMpsControlClient:
             pass
         pid = int(raw_pid)
         if not self.daemon_process_alive(pid):
-            raise MpsControlError(f"native PID file {pid_file} names dead pid {pid}")
+            raise MpsControlError(
+                f"MPS control socket {pipe_dir / 'control'} names dead pid {pid}"
+            )
         else:
             pass
 
@@ -117,7 +144,7 @@ class SubprocessMpsControlClient:
             raise MpsControlError(f"cannot inspect daemon pid {pid}: {exc}") from exc
         if Path(os.fsdecode(cmdline)).name != _CONTROL_BINARY:
             raise MpsControlError(
-                f"native PID file {pid_file} names {os.fsdecode(cmdline)!r}, not "
+                f"MPS control socket {pipe_dir / 'control'} names {os.fsdecode(cmdline)!r}, not "
                 f"{_CONTROL_BINARY}"
             )
         else:

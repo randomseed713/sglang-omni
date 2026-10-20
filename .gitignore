@@ -33,6 +33,7 @@ htmlcov/
 *.txt
 # Build definitions are sources, not logs.
 !CMakeLists.txt
+!packaging/cu129-*.txt
 # Frozen judge prompts are hashed benchmark assets.
 !benchmarks/duplex/semantic/*.txt
 output.wav

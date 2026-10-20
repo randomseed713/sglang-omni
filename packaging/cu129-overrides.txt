@@ -1,0 +1,18 @@
+# CUDA 12.9 profile; apply explicitly without changing the default dependencies.
+cuda-python>=12.9,<13
+torch==2.13.0+cu129
+torchvision==0.28.0+cu129
+torchaudio==2.11.0+cu129
+torchcodec==0.15.0+cu129
+sglang==0.5.21+cu129
+sglang-kernel==0.4.7+cu129
+flashinfer-python[cu12]==0.6.18
+humming-kernels[cu12]==0.1.12
+nvidia-cutlass-dsl==4.6.2
+# These optional execution paths require packages outside the validated profile.
+nixl-cu13; python_version < '0'
+mooncake-transfer-engine-cuda13; python_version < '0'
+nvshmem4py-cu13; python_version < '0'
+sgl-deep-gemm; python_version < '0'
+# MiniCPM-o uses NumPy 1.x; dots-tts requires a separate NumPy 2.x environment.
+dots-tts; python_version < '0'

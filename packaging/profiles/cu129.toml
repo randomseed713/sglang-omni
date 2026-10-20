@@ -1,0 +1,109 @@
+patches = ["sm8x-sm90-fa3.patch"]
+source_commit = "e00930c5489053f26d86b179cee0d087f846acbb"
+python = "3.10"
+sglang_version = "0.5.21+cu129"
+torch_version = "2.13.0+cu129"
+torch_index = "https://download.pytorch.org/whl/cu129"
+build_requirements = [
+    "setuptools>=77", "setuptools-rust>=1.11", "setuptools-scm>=8",
+    "wheel",
+    "scikit-build-core>=0.10", "cmake>=3.31,<4", "ninja>=1.11",
+]
+
+[environment]
+TORCH_CUDA_ARCH_LIST = "8.0;8.6;8.9;9.0"
+SGLANG_BUILD_RUST_EXTS = "none"
+
+[kernel_settings]
+"cmake.define.ENABLE_BELOW_SM90" = "ON"
+# Disable SM100+ GPU code, but retain the upstream sm100/ precise-math
+# library required by the SM8x loader (its name is not its architecture set).
+"cmake.define.SGL_KERNEL_ENABLE_SM100" = "OFF"
+"cmake.define.SGL_KERNEL_ENABLE_FA3" = "ON"
+"cmake.define.SGL_KERNEL_COMPILE_THREADS" = "2"
+
+# Exact replacements deliberately fail if the upstream baseline changes.
+[[edits]]
+path = "python/pyproject.toml"
+old = '"cuda-python>=13.0"'
+new = '"cuda-python>=12.9,<13"'
+
+[[edits]]
+path = "python/pyproject.toml"
+old = '"flashinfer_python[cu13]==0.6.18"'
+new = '"flashinfer_python[cu12]==0.6.18"'
+
+[[edits]]
+path = "python/pyproject.toml"
+old = '"humming-kernels[cu13]==0.1.12"'
+new = '"humming-kernels[cu12]==0.1.12"'
+
+[[edits]]
+path = "python/pyproject.toml"
+old = '"nvidia-cutlass-dsl[cu13]==4.6.2"'
+new = '"nvidia-cutlass-dsl==4.6.2"'
+
+# This profile does not support NVSHMEM-dependent execution paths.
+[[edits]]
+path = "python/pyproject.toml"
+old = '  "nvshmem4py-cu13",'
+new = ''
+
+[[edits]]
+path = "python/pyproject.toml"
+old = '"sglang-kernel==0.4.7"'
+new = '"sglang-kernel==0.4.7+cu129"'
+
+[[edits]]
+path = "python/pyproject.toml"
+old = '''  "torch==2.13.0",
+  "torch_memory_saver>=0.0.9.post1",'''
+new = '''  "torch==2.13.0+cu129",
+  "torch_memory_saver>=0.0.9.post1",'''
+
+[[edits]]
+path = "python/sglang/kernels/aot/pyproject.toml"
+old = 'version = "0.4.7"'
+new = 'version = "0.4.7+cu129"'
+
+[[edits]]
+path = "python/sglang/kernels/aot/python/sgl_kernel/version.py"
+old = '__version__ = "0.4.7"'
+new = '__version__ = "0.4.7+cu129"'
+
+# MiniCPM-o does not use the DeepGEMM execution paths.
+[[edits]]
+path = "python/pyproject.toml"
+old = '  "sgl-deep-gemm==0.2.0",'
+new = ''
+
+# note (Codex): GCC 10 lacks std::bit_cast; pointer alignment uses an integer address.
+[[edits]]
+path = "python/sglang/kernels/jit/include/sgl_kernel/tensor.h"
+old = 'std::bit_cast<uintptr_t>(view.data_ptr())'
+new = 'reinterpret_cast<uintptr_t>(view.data_ptr())'
+
+# note (Codex): Public enum inheritance preserves the constants on GCC 10.
+[[edits]]
+path = "python/sglang/kernels/jit/include/sgl_kernel/warp.cuh"
+old = '''struct LoadStorePattern {
+  using enum LoadStoreBytes::type;'''
+new = 'struct LoadStorePattern : LoadStoreBytes {'
+
+[[edits]]
+path = "python/sglang/kernels/jit/csrc/elementwise/kvcache.cuh"
+old = '  using enum warp::LoadStorePattern::type;'
+new = '  constexpr auto WARP_UNIFORM_16B = warp::LoadStorePattern::WARP_UNIFORM_16B;'
+
+[[edits]]
+path = "python/sglang/kernels/jit/csrc/elementwise/kvcache.cuh"
+old = '    using enum LoadStorePattern::type;'
+new = '    constexpr auto WARP_UNIFORM_16B = LoadStorePattern::WARP_UNIFORM_16B;'
+
+# note (Codex): SM8x SplitKV changes the semaphore layout with context length.
+[[edits]]
+path = "python/sglang/srt/layers/attention/flashattention_backend.py"
+old = '            self._get_scheduler_metadata = get_scheduler_metadata'
+new = '''            self._get_scheduler_metadata = (
+                get_scheduler_metadata if device_capability[0] >= 9 else None
+            )'''

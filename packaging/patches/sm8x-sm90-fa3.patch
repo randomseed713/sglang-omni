@@ -1,0 +1,120 @@
+--- a/python/sglang/kernels/aot/CMakeLists.txt
++++ b/python/sglang/kernels/aot/CMakeLists.txt
+@@ -178,6 +178,7 @@
+ option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
+ option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
+ option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
++option(SGL_KERNEL_ENABLE_SM100 "Build SM100 and newer GPU targets" ON)
+ 
+ if (SGL_KERNEL_ENABLE_BF16)
+     list(APPEND SGL_KERNEL_CUDA_FLAGS
+@@ -196,6 +197,7 @@
+ if (ENABLE_BELOW_SM90)
+     list(APPEND SGL_KERNEL_CUDA_FLAGS
+         "-gencode=arch=compute_80,code=sm_80"
++        "-gencode=arch=compute_86,code=sm_86"
+         "-gencode=arch=compute_89,code=sm_89"
+     )
+     if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+@@ -206,7 +208,7 @@
+ 
+ endif()
+ 
+-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
++if (SGL_KERNEL_ENABLE_SM100 AND ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A))
+     # sm_100f is available in CUDA 12.9+ and covers all sm_100, sm_103, sm_107, sm_10x
+     if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.9")
+         list(APPEND SGL_KERNEL_CUDA_FLAGS
+@@ -328,6 +330,7 @@
+     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
+ )
+ 
++if (SGL_KERNEL_ENABLE_SM100 OR ENABLE_BELOW_SM90)
+ # =========================== Common SM100+ Build ============================= #
+ # Build SM100+ library with precise math (same namespace, different directory)
+ Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+@@ -341,6 +344,8 @@
+     OUTPUT_NAME "common_ops"
+     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
+ )
++
++endif()
+ 
+ find_package(Python3 COMPONENTS Interpreter REQUIRED)
+ execute_process(
+@@ -359,7 +364,9 @@
+ endif()
+ 
+ target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
++if (SGL_KERNEL_ENABLE_SM100 OR ENABLE_BELOW_SM90)
+ target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
++endif()
+ 
+ # sparse flash attention
+ target_compile_definitions(common_ops_sm90_build PRIVATE
+@@ -367,17 +374,21 @@
+     FLASHATTENTION_DISABLE_DROPOUT
+     FLASHATTENTION_DISABLE_UNEVEN_K
+ )
++if (SGL_KERNEL_ENABLE_SM100 OR ENABLE_BELOW_SM90)
+ target_compile_definitions(common_ops_sm100_build PRIVATE
+     FLASHATTENTION_DISABLE_BACKWARD
+     FLASHATTENTION_DISABLE_DROPOUT
+     FLASHATTENTION_DISABLE_UNEVEN_K
+ )
++endif()
+ 
+ # Install to different subdirectories
+ # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
+ # and install them to the specified destinations
+ install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
++if (SGL_KERNEL_ENABLE_SM100 OR ENABLE_BELOW_SM90)
+ install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
++endif()
+ 
+ # ============================ Optional Install: FA3 ============================= #
+ # set flash-attention sources file
+@@ -410,6 +421,7 @@
+         list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
+             "-gencode=arch=compute_80,code=sm_80"
+             "-gencode=arch=compute_86,code=sm_86"
++            "-gencode=arch=compute_89,code=sm_89"
+         )
+         # SM8X Logic
+         file(GLOB FA3_SM8X_GEN_SRCS
+@@ -506,10 +518,14 @@
+ # Arch gencodes: match the original setup.py auto-detection
+ # (80 always; 90 for CUDA>=11.8; 120 for CUDA>=12.8).
+ if (ENABLE_BELOW_SM90)
+-    list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_80,code=sm_80")
++    list(APPEND INFLLM_FLASH_CUDA_FLAGS
++        "-gencode=arch=compute_80,code=sm_80"
++        "-gencode=arch=compute_86,code=sm_86"
++        "-gencode=arch=compute_89,code=sm_89"
++    )
+ endif()
+ list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_90,code=sm_90")
+-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
++if (SGL_KERNEL_ENABLE_SM100 AND ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A))
+     list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_120a,code=sm_120a")
+ endif()
+ 
+--- a/python/sglang/kernels/aot/cmake/flashmla.cmake
++++ b/python/sglang/kernels/aot/cmake/flashmla.cmake
+@@ -34,14 +34,14 @@
+         "-gencode=arch=compute_90a,code=sm_90a"
+     )
+ endif()
+-if(${CUDA_VERSION} VERSION_GREATER 12.8)
++if(SGL_KERNEL_ENABLE_SM100 AND ${CUDA_VERSION} VERSION_GREATER 12.8)
+     # sm_100f is compatible with all sm_10x
+     list(APPEND FLASHMLA_CUDA_FLAGS
+         "-gencode=arch=compute_100f,code=sm_100f"
+     )
+     set(FLASHMLA_ENABLE_SM100 ON)
+ endif()
+-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
++if(SGL_KERNEL_ENABLE_SM100 AND ${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+     # B300 is sm_103; sm_100f is family-compatible so it runs there, but ptxas emits
+     # better SASS for the native arch. FlashMLA's setup.py picks sm_100a + sm_103a
+     # over sm_100f for the same reason. The cutlass patch below is what lets a TU
